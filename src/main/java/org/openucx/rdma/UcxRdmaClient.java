@@ -4,22 +4,28 @@ import org.openucx.jucx.UcxCallback;
 import org.openucx.jucx.ucp.*;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 
 /**
  * Minimal UCX/JUCX-based client that connects to a {@link UcxRdmaServer},
  * sends a single message and waits for a reply using tagged operations.
  *
- * This class has NO dependency on Spark – it uses only the JUCX APIs.
+ * This class uses worker-address exchange to enable RDMA/EFA transport
+ * selection by UCX, rather than socket-address endpoints which force TCP.
  */
 public class UcxRdmaClient implements Closeable {
 
     private final UcpContext context;
     private final UcpWorker worker;
     private final UcpEndpoint endpoint;
+    private final Socket bootstrapSocket;
 
-    public UcxRdmaClient(String host, int port) {
+    public UcxRdmaClient(String host, int port) throws Exception {
+        UcxNative.load();
         UcpParams params = new UcpParams()
                 .requestTagFeature()
                 .setMtWorkersShared(true);
@@ -27,8 +33,32 @@ public class UcxRdmaClient implements Closeable {
         this.context = new UcpContext(params);
         this.worker = context.newWorker(new UcpWorkerParams());
 
+        // --- Worker Address Exchange (enables EFA/RDMA) ---
+        // 1. Connect to server via plain TCP socket for bootstrap
+        this.bootstrapSocket = new Socket();
+        bootstrapSocket.connect(new InetSocketAddress(host, port));
+
+        DataInputStream in = new DataInputStream(bootstrapSocket.getInputStream());
+        DataOutputStream out = new DataOutputStream(bootstrapSocket.getOutputStream());
+
+        // 2. Get our worker address and send it to server
+        ByteBuffer localAddress = worker.getAddress();
+        byte[] localAddrBytes = new byte[localAddress.remaining()];
+        localAddress.get(localAddrBytes);
+
+        out.writeInt(localAddrBytes.length);
+        out.write(localAddrBytes);
+        out.flush();
+
+        // 3. Receive server's worker address
+        int serverAddrLen = in.readInt();
+        byte[] serverAddrBytes = new byte[serverAddrLen];
+        in.readFully(serverAddrBytes);
+
+        // 4. Create endpoint from server's worker address (NOT socket address!)
+        // This allows UCX to select optimal transport (EFA SRD if available)
         UcpEndpointParams epParams = new UcpEndpointParams()
-                .setSocketAddress(new InetSocketAddress(host, port))
+                .setUcpAddress(ByteBuffer.wrap(serverAddrBytes))
                 .setPeerErrorHandlingMode();
 
         this.endpoint = worker.newEndpoint(epParams);
@@ -83,7 +113,11 @@ public class UcxRdmaClient implements Closeable {
         endpoint.close();
         worker.close();
         context.close();
+        try {
+            bootstrapSocket.close();
+        } catch (Exception e) {
+            // ignore
+        }
     }
 }
-
 

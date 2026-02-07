@@ -4,27 +4,31 @@ import org.openucx.jucx.UcxCallback;
 import org.openucx.jucx.ucp.*;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
-import java.util.concurrent.CountDownLatch;
 
 /**
  * Minimal UCX/JUCX-based server that accepts a single client connection and
  * performs a simple request/response (echo) exchange using tagged send/recv.
  *
- * This class has NO dependency on Spark – it uses only the JUCX APIs.
+ * This class uses worker-address exchange to enable RDMA/EFA transport
+ * selection by UCX, rather than socket-address endpoints which force TCP.
  */
 public class UcxRdmaServer implements Closeable {
 
     private final UcpContext context;
     private final UcpWorker worker;
-    private final UcpListener listener;
+    private final ServerSocket bootstrapServer;
 
     private volatile UcpEndpoint endpoint;
+    private volatile Socket clientSocket;
 
-    private final CountDownLatch connectionEstablished = new CountDownLatch(1);
-
-    public UcxRdmaServer(String host, int port) {
+    public UcxRdmaServer(String host, int port) throws Exception {
+        UcxNative.load();
         UcpParams params = new UcpParams()
                 .requestTagFeature()
                 .setMtWorkersShared(true);
@@ -32,27 +36,43 @@ public class UcxRdmaServer implements Closeable {
         this.context = new UcpContext(params);
         this.worker = context.newWorker(new UcpWorkerParams());
 
-        UcpListenerParams listenerParams = new UcpListenerParams()
-                .setSockAddr(new InetSocketAddress(host, port))
-                .setConnectionHandler(this::onConnection);
-
-        this.listener = worker.newListener(listenerParams);
-    }
-
-    private void onConnection(UcpConnectionRequest request) {
-        UcpEndpointParams epParams = new UcpEndpointParams()
-                .setConnectionRequest(request)
-                .setPeerErrorHandlingMode();
-
-        this.endpoint = worker.newEndpoint(epParams);
-        connectionEstablished.countDown();
+        // Use plain TCP ServerSocket for bootstrap (address exchange only)
+        this.bootstrapServer = new ServerSocket();
+        bootstrapServer.setReuseAddress(true);
+        bootstrapServer.bind(new InetSocketAddress(host, port));
     }
 
     /**
-     * Blocks until a client is connected or the timeout elapses.
+     * Blocks until a client connects and completes worker address exchange.
      */
-    public void awaitConnection(long timeout) throws InterruptedException {
-         connectionEstablished.await();
+    public void awaitConnection(long timeout) throws Exception {
+        // Accept bootstrap connection
+        this.clientSocket = bootstrapServer.accept();
+
+        DataInputStream in = new DataInputStream(clientSocket.getInputStream());
+        DataOutputStream out = new DataOutputStream(clientSocket.getOutputStream());
+
+        // Receive client's worker address
+        int clientAddrLen = in.readInt();
+        byte[] clientAddrBytes = new byte[clientAddrLen];
+        in.readFully(clientAddrBytes);
+
+        // Send our worker address to client
+        ByteBuffer localAddress = worker.getAddress();
+        byte[] localAddrBytes = new byte[localAddress.remaining()];
+        localAddress.get(localAddrBytes);
+
+        out.writeInt(localAddrBytes.length);
+        out.write(localAddrBytes);
+        out.flush();
+
+        // Create endpoint from client's worker address (NOT connection request!)
+        // This allows UCX to select optimal transport (EFA SRD if available)
+        UcpEndpointParams epParams = new UcpEndpointParams()
+                .setUcpAddress(ByteBuffer.wrap(clientAddrBytes))
+                .setPeerErrorHandlingMode();
+
+        this.endpoint = worker.newEndpoint(epParams);
     }
 
     /**
@@ -109,10 +129,14 @@ public class UcxRdmaServer implements Closeable {
         if (endpoint != null) {
             endpoint.close();
         }
-        listener.close();
         worker.close();
         context.close();
+        try {
+            if (clientSocket != null) clientSocket.close();
+            bootstrapServer.close();
+        } catch (Exception e) {
+            // ignore
+        }
     }
 }
-
 
