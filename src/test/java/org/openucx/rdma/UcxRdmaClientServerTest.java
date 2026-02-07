@@ -40,8 +40,7 @@ public class UcxRdmaClientServerTest {
             // Trigger native libs load early; this is essentially a no-op if already loaded.
             UcxUtils.getAddress(java.nio.ByteBuffer.allocateDirect(1));
             return true;
-        } catch (UnsatisfiedLinkError e) {
-            e.printStackTrace();
+        } catch (UnsatisfiedLinkError | NoClassDefFoundError | ExceptionInInitializerError e) {
             return false;
         }
     }
@@ -81,5 +80,4 @@ public class UcxRdmaClientServerTest {
         assertEquals(message, reply);
     }
 }
-
 

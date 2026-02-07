@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: org.openucx.rdma.UcxRdmaClientServerTest
+-------------------------------------------------------------------------------
+Tests run: 0, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s - in org.openucx.rdma.UcxRdmaClientServerTest
